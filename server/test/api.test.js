@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createApp } = require("../app");
+const { makeRuleId } = require("../relation");
 
 let server;
 let base;
@@ -920,7 +921,7 @@ test("POST /api/relation/enhance refuses 422 and produces no schema when a sampl
       properties: { a: { type: "integer", minimum: 100 }, b: { type: "integer" } },
     },
     samples,
-    ruleIds: ["implication||a->b", "implication||b->a"],
+    ruleIds: [makeRuleId("implication", "", "a", "b"), makeRuleId("implication", "", "b", "a")],
   });
   assert.equal(res.status, 422);
   assert.equal(res.data.schema, undefined);
@@ -933,7 +934,7 @@ test("POST /api/relation/enhance rejects unknown rule ids with 422 details", asy
   const res = await post("/api/relation/enhance", {
     schema: { type: "object" },
     samples: [{}],
-    ruleIds: ["implication||nope->zzz"],
+    ruleIds: [makeRuleId("implication", "", "nope", "zzz")],
   });
   assert.equal(res.status, 422);
   assert.equal(res.data.schema, undefined);

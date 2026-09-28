@@ -8,6 +8,8 @@ const {
   enhanceSchema,
   collectScopes,
   reduceImplications,
+  makeRuleId,
+  parseRuleId,
   MAX_SAMPLES,
   MIN_SUPPORT,
 } = require("../relation");
@@ -268,8 +270,11 @@ test("enhanceSchema merges multiple implications sharing the same antecedent", (
   const mined = mineRelations({ samples }).scopes[0];
   const aRules = mined.implications.filter((r) => r.a === "a").map((r) => r.id);
   assert.deepEqual(
-    aRules.map((id) => id.split("|")[2]).sort(),
-    ["a->b", "a->c"]
+    aRules.map((id) => parseRuleId(id)).sort((x, y) => (x.b < y.b ? -1 : 1)),
+    [
+      { kind: "implication", scopePointer: "", a: "a", b: "b" },
+      { kind: "implication", scopePointer: "", a: "a", b: "c" },
+    ]
   );
   const { schema } = inferSchema(samples);
   const out = enhanceSchema({ schema, samples, ruleIds: aRules });
@@ -301,7 +306,7 @@ test("enhanceSchema rejects documents that violate the mined rules", () => {
     { c: 2 },
   ];
   const { schema } = inferSchema(samples);
-  const ruleIds = ["exclusion||a<x>c", "implication||a->b"];
+  const ruleIds = [makeRuleId("exclusion", "", "a", "c"), makeRuleId("implication", "", "a", "b")];
   const out = enhanceSchema({ schema, samples, ruleIds });
   const Ajv2020 = require("ajv/dist/2020").default;
   const validate = new Ajv2020({ strict: false }).compile(out.schema);
@@ -326,7 +331,7 @@ test("enhanceSchema refuses (422, no schema) when an original sample fails Ajv",
           { a: 1, b: 2 },
           { a: 3, b: 4 },
         ],
-        ruleIds: ["implication||a->b", "implication||b->a"],
+        ruleIds: [makeRuleId("implication", "", "a", "b"), makeRuleId("implication", "", "b", "a")],
       }),
     (err) => {
       assert.equal(err.status, 422);
@@ -341,40 +346,171 @@ test("enhanceSchema refuses (422, no schema) when an original sample fails Ajv",
 test("enhanceSchema refuses unknown or stale rule ids with per-id reasons", () => {
   const samples = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
   const { schema } = inferSchema(samples);
+  const staleId = makeRuleId("implication", "", "nope", "zzz");
   try {
-    enhanceSchema({ schema, samples, ruleIds: ["implication||nope->zzz"] });
+    enhanceSchema({ schema, samples, ruleIds: [staleId] });
     assert.unreachable("should have thrown");
   } catch (err) {
     assert.equal(err.status, 422);
     assert.equal(err.details.invalidRules.length, 1);
-    assert.equal(err.details.invalidRules[0].id, "implication||nope->zzz");
+    assert.equal(err.details.invalidRules[0].id, staleId);
+  }
+});
+
+test("enhanceSchema rejects ids from the pre-framing id format as stale", () => {
+  const samples = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
+  const { schema } = inferSchema(samples);
+  try {
+    enhanceSchema({ schema, samples, ruleIds: ["implication||a->b"] });
+    assert.unreachable("should have thrown");
+  } catch (err) {
+    assert.equal(err.status, 422);
+    assert.equal(err.details.invalidRules.length, 1);
   }
 });
 
 test("enhanceSchema deduplicates repeated rule ids", () => {
   const samples = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
   const { schema } = inferSchema(samples);
-  const out = enhanceSchema({
-    schema,
-    samples,
-    ruleIds: ["implication||a->b", "implication||a->b"],
-  });
+  const id = makeRuleId("implication", "", "a", "b");
+  const out = enhanceSchema({ schema, samples, ruleIds: [id, id] });
   assert.equal(out.ruleCount, 1);
-  assert.deepEqual(out.ruleIds, ["implication||a->b"]);
+  assert.deepEqual(out.ruleIds, [id]);
 });
 
-test("enhanceSchema supports RFC 6901 escaped field names", () => {
+test("rule ids keep RFC 6901 special characters and special tokens distinguishable", () => {
   const samples = [
     { "a/b": 1, "c~d": 2 },
     { "a/b": 3, "c~d": 4 },
   ];
   const { schema } = inferSchema(samples);
   const mined = mineRelations({ samples }).scopes[0];
-  const id = mined.implications.find((r) => r.a === "a/b" && r.b === "c~d").id;
-  assert.match(id, /a~1b/);
-  assert.match(id, /c~0d/);
+  const rule = mined.implications.find((r) => r.a === "a/b" && r.b === "c~d");
+  const id = rule.id;
+  // Raw names are carried verbatim inside their length frames — RFC 6901
+  // escapes are never re-applied to the framed field payload, so "a/b" and
+  // "a~1b" cannot be confused for one another.
+  assert.ok(id.includes("3:a/b"));
+  assert.ok(id.includes("3:c~d"));
+  assert.ok(!id.includes("a~1b"));
+  assert.ok(!id.includes("c~0d"));
+  // These fields are root keys, so the scope is the empty root pointer.
+  assert.deepEqual(parseRuleId(id), {
+    kind: "implication",
+    scopePointer: "",
+    a: "a/b",
+    b: "c~d",
+  });
   const out = enhanceSchema({ schema, samples, ruleIds: [id] });
   assert.deepEqual(out.schema.dependentRequired, { "a/b": ["c~d"] });
+});
+
+test("rule ids frame RFC 6901 escapes inside nested scope pointers", () => {
+  // A nested object whose own key contains "/" and "~": the scope pointer
+  // addresses that node with 6901 escapes while the framed fields stay raw.
+  const samples = [
+    { "x/y": { "a/b": 1, c: 2 } },
+    { "x/y": { "a/b": 3, c: 4 } },
+  ];
+  const mined = mineRelations({ samples }).scopes.find(
+    (g) => g.scopePointer === "/properties/x~1y"
+  );
+  assert.ok(mined);
+  const rule = mined.implications.find((r) => r.a === "a/b" && r.b === "c");
+  assert.ok(rule);
+  assert.ok(rule.id.includes("16:/properties/x~1y"));
+  assert.deepEqual(parseRuleId(rule.id), {
+    kind: "implication",
+    scopePointer: "/properties/x~1y",
+    a: "a/b",
+    b: "c",
+  });
+});
+
+test("rule ids never collide for field names carrying |, ->, <x> or 6901 escapes", () => {
+  // The exact collision from the bug report: ("a->b" -> c) and (a -> "b->c")
+  // share one scope. The old separator-based id gave both "implication||a->b->c".
+  const samples = [
+    { "a->b": 1, c: 2 },
+    { "a->b": 3, c: 4 },
+    { a: 5, "b->c": 6 },
+    { a: 7, "b->c": 8 },
+  ];
+  const { schema } = inferSchema(samples);
+  const root = mineRelations({ samples, schema }).scopes[0];
+
+  const firstEdge = root.implications.find((r) => r.a === "a->b" && r.b === "c");
+  const secondEdge = root.implications.find((r) => r.a === "a" && r.b === "b->c");
+  assert.ok(firstEdge && secondEdge);
+  assert.notEqual(firstEdge.id, secondEdge.id);
+
+  // Ticking the first edge must apply ONLY dependentRequired["a->b"]=["c"] and
+  // must not impose the unrelated a -> b->c constraint.
+  const out = enhanceSchema({ schema, samples, ruleIds: [firstEdge.id] });
+  assert.deepEqual(out.rules.map((r) => [r.a, r.b]), [["a->b", "c"]]);
+  assert.deepEqual(out.schema.dependentRequired, { "a->b": ["c"] });
+
+  const Ajv2020 = require("ajv/dist/2020").default;
+  const validate = new Ajv2020({ strict: false }).compile(out.schema);
+  assert.equal(validate({ "a->b": 1, c: 2 }), true); // satisfies the picked rule
+  assert.equal(validate({ "a->b": 1 }), false); // violates picked a->b => c
+  // A document that only violates the NOT-picked a -> b->c edge must still
+  // pass: the enhancer never applies the relation the user did not select.
+  assert.equal(validate({ a: 5 }), true);
+});
+
+test("makeRuleId is injective over kind/scope/two fields and parseRuleId inverts it", () => {
+  const names = [
+    "a",
+    "",
+    "a->b",
+    "a|b",
+    "a<x>b",
+    "a/b",
+    "a~b",
+    "a~1b",
+    "a~0b",
+    "1:ab",
+    "0:",
+    "12:abc|imp|",
+    "->",
+    "<x>",
+    ":",
+    "p|q->r<x>s~/",
+  ];
+  const pointers = ["", "/properties/a|x", "/properties/a~1b", "|", "0:|->"];
+  const seen = new Set();
+  let count = 0;
+  for (const kind of ["implication", "exclusion"]) {
+    for (const scope of pointers) {
+      for (const a of names) {
+        for (const b of names) {
+          if (a === b) continue;
+          const id = makeRuleId(kind, scope, a, b);
+          assert.equal(seen.has(id), false, `collision on ${id}`);
+          seen.add(id);
+          assert.deepEqual(parseRuleId(id), { kind, scopePointer: scope, a, b });
+          count += 1;
+        }
+      }
+    }
+  }
+  assert.ok(count > 0);
+  for (const bad of [
+    "implication||a->b", // old separator-based format
+    "implication|0|1:a->1:b", // missing colon after pointer length
+    "bogus|0:|1:a->1:b", // unknown kind
+    "implication|0:|1:a<x>1:b", // wrong field join for the kind
+    "implication|0:|1:a-1:b", // missing join
+    "implication|x:|1:a->1:b", // non-numeric length
+    "implication|0:|3:ab->1:b", // declared length overruns the field
+    "implication|0:|1:a->1:b|", // trailing junk
+    "",
+    null,
+    42,
+  ]) {
+    assert.equal(parseRuleId(bad), null);
+  }
 });
 
 test("mineRelations validates its input shape and sample cap", () => {

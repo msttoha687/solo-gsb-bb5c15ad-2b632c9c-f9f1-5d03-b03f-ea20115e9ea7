@@ -36,6 +36,24 @@
  * Every ORIGINAL sample is then re-validated against the enhanced schema with
  * Ajv; a single failure refuses the run (422) together with the failing sample
  * indexes — no enhanced schema is produced.
+ *
+ * Rule identity
+ * -------------
+ * A rule is the quadruple (kind, scopePointer, fieldA, fieldB). Field names
+ * come straight from JSON and may contain ANY character — including the tokens
+ * used to render a rule ("|", "->", "<x>") and the RFC 6901 escape characters
+ * "~" and "/" (and scope pointers embed those field names verbatim) — so the
+ * id cannot rely on fixed separators or 6901 escaping alone: "a->b"/"c" and
+ * "a"/"b->c" would otherwise render identically. The pointer and both fields
+ * therefore carry an explicit decimal code-unit length prefix, which frames
+ * every raw segment unambiguously:
+ *
+ *   implication|<plen>:<pointer>|<alen>:<rawA>-><blen>:<rawB>
+ *   exclusion|<plen>:<pointer>|<alen>:<rawA><x><blen>:<rawB>
+ *
+ * Each boundary is structural (length header terminated by ":") rather than
+ * lexical, so "|" appearing inside a pointer or a field never blurs a frame;
+ * the id is injective over the quadruple and parseable back (parseRuleId).
  */
 
 const Ajv2020 = require("ajv/dist/2020").default;
@@ -257,9 +275,67 @@ function reduceImplications(nodes, edges) {
   return kept;
 }
 
+const RULE_KINDS = { implication: "->", exclusion: "<x>" };
+
+/**
+ * Build the collision-free id for (kind, scopePointer, a, b). The pointer and
+ * both field names are framed with an explicit code-unit length, so segments
+ * containing "|", "->", "<x>", ":" or the RFC 6901 escape characters ("~",
+ * "/") — and even digit/colon sequences — never blur a boundary. See the file
+ * header.
+ */
 function makeRuleId(kind, pointer, a, b) {
-  const esc = (s) => escapePointer(s);
-  return `${kind}|${pointer}|${esc(a)}${kind === "implication" ? "->" : "<x>"}${esc(b)}`;
+  const join = RULE_KINDS[kind];
+  const frame = (s) => `${String(s).length}:${s}`;
+  return `${kind}|${frame(pointer)}|${frame(a)}${join}${frame(b)}`;
+}
+
+/**
+ * Inverse of makeRuleId. Returns { kind, scopePointer, a, b } or null when the
+ * id does not match the framed grammar (e.g. a stale id from an older build).
+ */
+function parseRuleId(id) {
+  if (typeof id !== "string") return null;
+  const firstBar = id.indexOf("|");
+  if (firstBar === -1) return null;
+  const kind = id.slice(0, firstBar);
+  const join = RULE_KINDS[kind];
+  if (!join) return null;
+
+  const body = id.slice(firstBar + 1);
+  let pos = 0;
+
+  // Read one "<decimal-length>:<raw>" frame starting at `pos`, verify the raw
+  // segment really has that length, then require `after` (an exact string) to
+  // follow it (empty string = end of id must follow).
+  function readFrame(after) {
+    const colon = body.indexOf(":", pos);
+    if (colon === -1) return null;
+    const digits = body.slice(pos, colon);
+    if (!/^\d+$/.test(digits)) return null; // digits only; no sign/leading junk
+    const length = Number(digits);
+    const start = colon + 1;
+    const end = start + length;
+    if (end > body.length) return null;
+    const value = body.slice(start, end);
+    pos = end;
+    if (after === "") {
+      if (pos !== body.length) return null;
+    } else if (body.slice(pos, pos + after.length) !== after) {
+      return null;
+    } else {
+      pos += after.length;
+    }
+    return value;
+  }
+
+  const pointer = readFrame("|");
+  if (pointer === null) return null;
+  const a = readFrame(join);
+  if (a === null) return null;
+  const b = readFrame("");
+  if (b === null) return null;
+  return { kind, scopePointer: pointer, a, b };
 }
 
 /** Resolve an object-typed schema node along a scope pointer ("" = root). */
@@ -639,6 +715,8 @@ module.exports = {
   enhanceSchema,
   collectScopes,
   reduceImplications,
+  makeRuleId,
+  parseRuleId,
   MAX_SAMPLES,
   MIN_SUPPORT,
 };

@@ -475,7 +475,7 @@ npm run dev:client   # 前端 http://localhost:5173（/api 代理到 8080）
 ## 测试
 
 ```bash
-npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘、错误热点聚簇、HTTP API 与发布门禁（261 项）
+npm test             # node:test，覆盖归纳引擎、契约比较器、反例生成器、样本影响扫描、样本贡献度、事件变体契约、匿名化导出、契约切片、历史样本迁移（含输入绑定/过期响应判定）、字段关系挖掘（含规则标识无碰撞）、错误热点聚簇、HTTP API 与发布门禁（265 项）
 ```
 
 ## API
@@ -495,7 +495,7 @@ npm test             # node:test，覆盖归纳引擎、契约比较器、反例
 | POST | `/api/slice` | `{ schema: {...}, samples: [<any>, ...], pointers: ["/properties/a", "/properties/tags/items"] }`（样本 ≤ 200 条，Pointer 1–20 个，`""` 表示根） | `{ schema, samples, fieldCount, sampleCount, pointers, ignored: [{ pointer, reason }] }`；Pointer 非法/未命中返回 422 并携带 `invalidPointers`，任一投影样本未通过 Ajv 校验返回 422 并携带 `failures: [{ index, errors }]`，均不产出切片 |
 | POST | `/api/migrate` | `{ baselineSchema?: {...}, currentSchema: {...}, samples: [<any>, ...]（≤ 200）, mappings: [{ from: "/a", to: "/b", default?: <JSON> }] }`（源可用 `""` 表示根；目标末段 `-` 追加数组） | `{ total, summary: { success, conflict, invalid }, plan: { sourceRemovals: [{ mapping, pointer }], targetWrites: [{ mapping, pointer }] }, mappings: [{ index, from, to, hasDefault }], samples: [{ index, status, before, after, reasons, operations: [{ kind, from?, to, reason? }], baseline: { valid, errors }?, current: { valid, errors } }] }`；映射语义非法（非法 Pointer、目标为根、源目标相同、源重复、目标父子重叠、`-` 位置错误）返回 422 并携带 `invalidMappings`，冲突样本 `after` 为 `null` 且保持原样 |
 | POST | `/api/relation/mine` | `{ samples: [<any>, ...]（≤ 200）, schema?: {...} }`（schema 可选，传入时标注已被 `required` 覆盖的蕴含） | `{ sampleCount, scopeCount, minSupport: 2, summary: { implication, exclusion, removedByTransitiveReduction }, scopes: [{ scopePointer, scopeCount, fields: [{ name, count }], implications: [{ id, kind, scopePointer, a, b, support, scopeCount, confidence, sampleIndexes, witnessPaths, witnessPathsTruncated, alreadyEnforced }], exclusions: [{ id, kind, scopePointer, a, b, support, countA, countB, coOccurrence, scopeCount, confidence, sampleIndexes, witnessPathsA, witnessPathsB, witnessPathsTruncated }] }] }` |
-| POST | `/api/relation/enhance` | `{ schema: {...}, samples: [<any>, ...]（≤ 200）, ruleIds: ["implication\|\|a->b", "exclusion\|\|a<x>b"] }` | `{ schema, sampleCount, ruleCount, ruleIds, rules }`；规则 id 失效返回 422 并携带 `invalidRules`；任一原样本未通过增强 Schema 的 Ajv 复验返回 422 并携带 `failures: [{ index, errors }]`，均不产出 Schema |
+| POST | `/api/relation/enhance` | `{ schema: {...}, samples: [<any>, ...]（≤ 200）, ruleIds: ["implication\|0:\|1:a->1:b", "exclusion\|0:\|1:a<x>1:b"] }` | `{ schema, sampleCount, ruleCount, ruleIds, rules }`；规则 id 失效返回 422 并携带 `invalidRules`；任一原样本未通过增强 Schema 的 Ajv 复验返回 422 并携带 `failures: [{ index, errors }]`，均不产出 Schema。规则 id 形如 `<类型>|<作用域长度>:<作用域>|<A长度>:<A><连接符><B长度>:<B>`（蕴含连接符 `->`、互斥 `<x>`），对类型、作用域 Pointer 与两个原始字段名做长度定界，含 `|`、`->`、`<x>`、`:` 或 RFC 6901 转义字符（`~`、`/`）的字段名也不会撞 id，应视为不透明字符串原样回传 |
 
 示例：
 
@@ -688,13 +688,14 @@ curl -s -X POST http://localhost:8080/api/relation/mine \
         {"kind":"deleted","reason":"dup"}]}'
 # -> { "scopeCount": 4, "summary": { "implication": 2, "exclusion": 1, ... },
 #      "scopes": [{ "scopePointer": "",
-#        "implications": [{ "id": "implication||at->kind", "support": 2, ... },
-#                         { "id": "implication||reason->kind", "support": 2, ... }],
-#        "exclusions":   [{ "id": "exclusion||at<x>reason", "support": 2,
+#        "implications": [{ "id": "implication|0:|2:at->4:kind", "support": 2, ... },
+#                         { "id": "implication|0:|6:reason->4:kind", "support": 2, ... }],
+#        "exclusions":   [{ "id": "exclusion|0:|2:at<x>6:reason", "support": 2,
 #                           "witnessPathsA": ["#/0", "#/1"],
 #                           "witnessPathsB": ["#/2", "#/3"], ... }] }] }
+# —— id 对类型/作用域/两个原始字段名做长度定界，字段名含 |、->、<x>、~、/ 也不撞 id；客户端原样回传即可
 
-# 2) 勾选互斥规则生成增强 Schema（后端重挖校验规则 id，并用 Ajv 复验全部原样本）
+# 2) 勾选互斥规则生成增强 Schema（后端按当前样本重新挖掘校验规则 id，并用 Ajv 复验全部原样本）
 curl -s -X POST http://localhost:8080/api/relation/enhance \
   -H 'Content-Type: application/json' \
   -d '{"schema":{"type":"object",
@@ -705,7 +706,7 @@ curl -s -X POST http://localhost:8080/api/relation/enhance \
          {"kind":"created","at":"2026-01-02"},
          {"kind":"deleted","reason":"spam"},
          {"kind":"deleted","reason":"dup"}],
-       "ruleIds":["exclusion||at<x>reason"]}'
+       "ruleIds":["exclusion|0:|2:at<x>6:reason"]}'
 # -> { "ruleCount": 1, "sampleCount": 4,
 #      "schema": { ..., "allOf": [{ "not": { "required": ["at", "reason"] } }] } }
 # —— 任一样本复验失败（或规则 id 已失效）时返回 422 且不产出 schema
