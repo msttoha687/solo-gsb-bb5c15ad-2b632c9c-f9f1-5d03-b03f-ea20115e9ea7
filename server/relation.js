@@ -257,9 +257,65 @@ function reduceImplications(nodes, edges) {
   return kept;
 }
 
+/**
+ * Injective escaping for a rule-id component.
+ *
+ * Every byte outside [A-Za-z0-9-_.] is percent-encoded (UTF-8), including
+ * the structural characters used inside a rule id ("|", "-", ">", "<",
+ * "%"), JSON Pointer's "/" and "~", and the RFC 6901 escape digits following
+ * a raw "~". With `pointerShape`, a literal "/" or "~" stays raw so scope
+ * pointers keep their JSON Pointer spelling (they arrive already RFC 6901
+ * escaped); a field segment can then never start with "/" or contain a raw
+ * "~", which keeps the scope/field boundary unambiguous as well.
+ *
+ * RFC 6901 escapes alone are not enough here: they leave "|", "->", "<x>"
+ * verbatim and two marker-bearing field names concatenated to the same
+ * string ("a" + "->" + "b->c" === "a->b" + "->" + "c"). Percent-escaping
+ * every structural byte makes the mapping (kind, scopePointer, a, b) -> id
+ * one-to-one regardless of the names.
+ *
+ * @param {string} part
+ * @param {{ pointerShape?: boolean }} [opts]
+ * @returns {string}
+ */
+function encodeRuleIdPart(part, { pointerShape = false } = {}) {
+  let out = "";
+  for (const byte of Buffer.from(String(part), "utf8")) {
+    const isUnreserved =
+      (byte >= 0x30 && byte <= 0x39) || // 0-9
+      (byte >= 0x41 && byte <= 0x5a) || // A-Z
+      (byte >= 0x61 && byte <= 0x7a) || // a-z
+      byte === 0x2d || // -
+      byte === 0x5f || // _
+      byte === 0x2e; // .
+    if (isUnreserved || (pointerShape && (byte === 0x2f || byte === 0x7e))) {
+      out += String.fromCharCode(byte); // "/" or "~" only inside pointers
+    } else {
+      out += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+  }
+  return out;
+}
+
+/**
+ * Unambiguous rule identity over the rule kind, its scope pointer and the
+ * two ORIGINAL (unescaped) field names:
+ *
+ *   implication: implication|<enc(pointer)>|<enc(a)>-><enc(b)>
+ *   exclusion:   exclusion|<enc(pointer)>|<enc(a)><x><enc(b)>
+ *
+ * Every encoded field segment is free of "|", ">", "<", "~" and "/" (see
+ * encodeRuleIdPart); a lone "-" may appear, but it cannot form the "->"
+ * marker without a raw ">", so the delimiters and kind marker cannot be
+ * forged by a field name — ticking one rule can never resolve to another.
+ * The same id format is used by the mining list, the client's selection
+ * state and the enhance endpoint.
+ */
 function makeRuleId(kind, pointer, a, b) {
-  const esc = (s) => escapePointer(s);
-  return `${kind}|${pointer}|${esc(a)}${kind === "implication" ? "->" : "<x>"}${esc(b)}`;
+  const enc = (s) => encodeRuleIdPart(s);
+  const scope = encodeRuleIdPart(pointer, { pointerShape: true });
+  const marker = kind === "implication" ? "->" : "<x>";
+  return `${kind}|${scope}|${enc(a)}${marker}${enc(b)}`;
 }
 
 /** Resolve an object-typed schema node along a scope pointer ("" = root). */
@@ -639,6 +695,8 @@ module.exports = {
   enhanceSchema,
   collectScopes,
   reduceImplications,
+  makeRuleId,
+  encodeRuleIdPart,
   MAX_SAMPLES,
   MIN_SUPPORT,
 };

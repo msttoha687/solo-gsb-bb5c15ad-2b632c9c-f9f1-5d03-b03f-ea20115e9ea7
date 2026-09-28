@@ -8,6 +8,7 @@ const {
   enhanceSchema,
   collectScopes,
   reduceImplications,
+  makeRuleId,
   MAX_SAMPLES,
   MIN_SUPPORT,
 } = require("../relation");
@@ -370,11 +371,134 @@ test("enhanceSchema supports RFC 6901 escaped field names", () => {
   ];
   const { schema } = inferSchema(samples);
   const mined = mineRelations({ samples }).scopes[0];
-  const id = mined.implications.find((r) => r.a === "a/b" && r.b === "c~d").id;
-  assert.match(id, /a~1b/);
-  assert.match(id, /c~0d/);
+  const rule = mined.implications.find((r) => r.a === "a/b" && r.b === "c~d");
+  const id = rule.id;
+  // Field segments carry percent escapes, never raw "/" or "~" (the RFC 6901
+  // escape characters): they cannot mimic pointer structure or "~0"/"~1".
+  const fieldPart = id.split("|")[2];
+  assert.match(fieldPart, /a%2Fb/);
+  assert.match(fieldPart, /c%7Ed/);
+  assert.doesNotMatch(fieldPart, /a~1b/);
+  assert.doesNotMatch(fieldPart, /c~0d/);
   const out = enhanceSchema({ schema, samples, ruleIds: [id] });
   assert.deepEqual(out.schema.dependentRequired, { "a/b": ["c~d"] });
+});
+
+test("rule ids stay distinct when field names contain | -> <x>", () => {
+  // The reported collision: in one scope, "a" -> "b->c" and "a->b" -> "c"
+  // used to serialize to the same id "implication||a->b->c".
+  const samples = [
+    { a: 1, "b->c": 2, c: 3 },
+    { a: 4, "b->c": 5, c: 6 },
+    { "a->b": 1, c: 2 },
+    { "a->b": 3, c: 4 },
+  ];
+  const root = mineRelations({ samples }).scopes[0];
+  const aImpliesBC = root.implications.find((r) => r.a === "a" && r.b === "b->c");
+  const aBImpliesC = root.implications.find((r) => r.a === "a->b" && r.b === "c");
+  assert.ok(aImpliesBC);
+  assert.ok(aBImpliesC);
+  assert.notEqual(aImpliesBC.id, aBImpliesC.id);
+  assert.equal(aImpliesBC.id, "implication||a->b-%3Ec");
+  assert.equal(aBImpliesC.id, "implication||a-%3Eb->c");
+
+  // Every mined rule (across all samples/kinds) must carry a unique id.
+  for (const group of mineRelations({ samples }).scopes) {
+    const seen = new Set();
+    for (const rule of [...group.implications, ...group.exclusions]) {
+      assert.equal(seen.has(rule.id), false, `duplicate rule id: ${rule.id}`);
+      seen.add(rule.id);
+    }
+  }
+});
+
+test("rule id escaping is injective over kinds, scopes and tricky field names", () => {
+  // Names built from the structural bytes of the id format and RFC 6901
+  // escapes: "|", "->", "<x>", "%", "/", "~", "~0", "~1".
+  const names = [
+    "",
+    "a",
+    "a|b",
+    "a->b",
+    "a<x>b",
+    "a%2Fb",
+    "a/b",
+    "a~b",
+    "a~0b",
+    "a~1b",
+    "~",
+    "~0",
+    "~1",
+    "%7C",
+    "x->y<x>z|",
+  ];
+  const pointers = ["", "/properties/a", "/properties/a%7Cb/items", "/properties/a~1b"];
+  const kinds = ["implication", "exclusion"];
+  const ids = new Map();
+  for (const kind of kinds) {
+    for (const pointer of pointers) {
+      for (const a of names) {
+        for (const b of names) {
+          const id = makeRuleId(kind, pointer, a, b);
+          const key = JSON.stringify([kind, pointer, a, b]);
+          const other = ids.get(id);
+          assert.equal(other, undefined, `collision: ${key} vs ${other} -> ${id}`);
+          ids.set(id, key);
+        }
+      }
+    }
+  }
+
+  // Encoded field segments never contain the raw structural characters, so
+  // the "|" delimiters, the scope boundary and "->"/"<x>" cannot be forged.
+  for (const name of names) {
+    const enc = makeRuleId("implication", "", name, name).split("|")[2];
+    const [left, right] = enc.split("->"); // marker is the only "->" present
+    for (const segment of [left, right]) {
+      // "%" is the percent-escape introducer (a literal "%" itself becomes
+      // "%25"), so it is safe within an encoded segment.
+      assert.doesNotMatch(segment, /[|<>~/]/);
+    }
+  }
+});
+
+test("rule ids distinguish the same field pair across scopes", () => {
+  const atRoot = makeRuleId("implication", "", "a", "b");
+  const inProp = makeRuleId("implication", "/properties/x", "a", "b");
+  const inItems = makeRuleId("implication", "/properties/x/items", "a", "b");
+  assert.equal(atRoot, "implication||a->b");
+  assert.equal(inProp, "implication|/properties/x|a->b");
+  assert.equal(inItems, "implication|/properties/x/items|a->b");
+  assert.equal(new Set([atRoot, inProp, inItems]).size, 3);
+});
+
+test("enhanceSchema applies only the ticked rule when ids previously collided", () => {
+  // Samples support both "a -> b->c" and "a->b -> c" in the root scope; the
+  // two edges used to share one id, so ticking one also injected the other.
+  const samples = [
+    { a: 1, "b->c": 2, c: 3 },
+    { a: 4, "b->c": 5, c: 6 },
+    { "a->b": 1, c: 2 },
+    { "a->b": 3, c: 4 },
+  ];
+  const { schema } = inferSchema(samples);
+  const root = mineRelations({ samples, schema }).scopes[0];
+  const ticked = root.implications.find((r) => r.a === "a->b" && r.b === "c");
+
+  const out = enhanceSchema({ schema, samples, ruleIds: [ticked.id] });
+  assert.equal(out.ruleCount, 1);
+  assert.deepEqual(out.schema.dependentRequired, { "a->b": ["c"] });
+  assert.equal(out.schema.allOf, undefined);
+
+  const Ajv2020 = require("ajv/dist/2020").default;
+  const validate = new Ajv2020({ strict: false }).compile(out.schema);
+  // Violates the TICKED relation "a->b" => "c"... impossible by construction
+  // since a sample carrying "a->b" always carries c in the training set; use
+  // a fresh document instead, which the enhanced schema must reject.
+  assert.equal(validate({ "a->b": 1 }), false);
+  // A document that violates only the OTHER relation is still accepted: the
+  // constraint for "a" => "b->c" must not have been injected.
+  assert.equal(validate({ a: 1, c: 9 }), true);
 });
 
 test("mineRelations validates its input shape and sample cap", () => {
